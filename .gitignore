@@ -2,7 +2,16 @@ node_modules/
 build/
 dist/
 coverage/
+.cache/
+models/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# Local Netlify folder
+.netlify/state.json
+.netlify/functions-out
+.netlify/opencode-instructions-*/
+netlify/functions/*.zip
+netlify/functions/manifest.json

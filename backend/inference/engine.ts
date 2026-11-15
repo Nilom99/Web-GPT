@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { LIMITS, MODEL_CONFIG } from '../config';
+import { LIMITS, MODEL_CONFIG, getCacheRoot } from '../config';
 import {
   RepetitionLoopDetector,
   buildChatPromptWithPrefix,
@@ -20,6 +20,11 @@ export interface GenerationResult {
 export interface StreamCallbacks {
   onToken: (token: string) => void;
   signal?: AbortSignal;
+  /**
+   * Absolute timestamp (ms) after which generation must stop. Used to stay
+   * inside the Netlify Function execution limit.
+   */
+  deadlineAt?: number;
 }
 
 const activeControllers = new Map<string, AbortController>();
@@ -63,7 +68,8 @@ export async function streamGeneration(
   }
 
   const promptFile = path.join(
-    os.tmpdir(),
+    getCacheRoot(),
+    'prompts',
     `webgpt-prompt-${req.requestId}-${Date.now()}.txt`
   );
 
@@ -71,15 +77,18 @@ export async function streamGeneration(
   let killHandle: NodeJS.Timeout | null = null;
 
   try {
-    const assets = await ensureModelReady();
+    const assets = await ensureModelReady(callbacks.signal);
     if (controller.signal.aborted) {
       return { requestId: req.requestId, content: '', finishReason: 'aborted' };
     }
 
     const { prompt, assistantPrefix } = buildChatPromptWithPrefix(req.messages);
+    await fsp.mkdir(path.dirname(promptFile), { recursive: true });
     await fsp.writeFile(promptFile, prompt, 'utf8');
 
-    const cpuCount = Math.max(1, Math.min(4, os.cpus().length || 2));
+    const detectedCpus =
+      typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+    const cpuCount = Math.max(1, Math.min(4, detectedCpus || 2));
     const args = [
       '-m',
       assets.modelPath,
@@ -151,10 +160,18 @@ export async function streamGeneration(
     };
     controller.signal.addEventListener('abort', onAbort, { once: true });
 
+    const deadlineBudget = callbacks.deadlineAt
+      ? callbacks.deadlineAt - Date.now()
+      : LIMITS.generationTimeoutMs;
+    const timeoutMs = Math.max(
+      1_000,
+      Math.min(LIMITS.generationTimeoutMs, deadlineBudget)
+    );
+
     timeoutHandle = setTimeout(() => {
       wasTimedOut = true;
       terminateChild();
-    }, LIMITS.generationTimeoutMs);
+    }, timeoutMs);
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -257,11 +274,13 @@ export async function streamGeneration(
 
 export async function runCompletion(
   req: ValidatedChatRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  deadlineAt?: number
 ): Promise<GenerationResult> {
   let combined = '';
   const result = await streamGeneration(req, {
     signal,
+    deadlineAt,
     onToken: (token) => {
       combined += token;
     },

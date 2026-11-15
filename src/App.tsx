@@ -91,13 +91,18 @@ export default function App() {
   useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+    // The serverless runtime prepares the model on demand, so polling is capped
+    // to avoid an endless request loop while the assistant is still warming up.
+    const MAX_POLL_ATTEMPTS = 20;
 
     const poll = async (init = false) => {
       try {
         const res = await fetchModelStatus(init);
         if (!active) return;
         setModelStatus(res);
-        if (!res.ready && res.status === 'loading') {
+        attempts += 1;
+        if (!res.ready && res.status === 'loading' && attempts < MAX_POLL_ATTEMPTS) {
           timer = setTimeout(() => poll(false), 1500);
         }
       } catch {

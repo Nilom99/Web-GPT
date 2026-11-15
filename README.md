@@ -51,6 +51,12 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+The Express dev server (`server.ts`) proxies `/api/*` to the same
+`backend/router.ts` that the Netlify Function uses, so behaviour is identical
+in development and in production. The model is fetched on demand and verified
+against the pinned SHA-256 checksum; `npm run build` and `npm test` prepare a
+verified copy in `.cache/webgpt/models/` first.
+
 ### Automated Tests
 
 ```bash
@@ -63,29 +69,62 @@ npm run build
 
 ## Netlify Deployment Configuration
 
-Configured in `netlify.toml` for project `verdant-kangaroo-6053a5`:
-- Publish directory: `dist`
-- Functions directory: `netlify/functions`
-- API routing: `/api/*` -> `/.netlify/functions/api/:splat`
+Configured in `netlify.toml` for project `nilgpt` (`https://nilgpt.netlify.app`):
+
+| Setting | Value |
+| --- | --- |
+| Build command | `npm run build` (Vite production build + verified model asset) |
+| Publish directory | `dist` |
+| Functions directory | `netlify/functions` |
+| Node runtime | `24` (`NODE_VERSION` in `[build.environment]`) |
+| Function bundler | `esbuild` |
+| Bundled function files | `runtime/llama/**` (runtime + shared libraries only) |
+| API routing | `/api/*` -> `/.netlify/functions/api/:splat` |
+| SPA fallback | `/*` -> `/index.html` |
+| Static caching | `/models/*` and `/assets/*` -> `max-age=31536000, immutable` |
+
+### How the model reaches the function
+
+The 73.9 MB GGUF file is **never** part of the function bundle. It is published as a
+static asset (`dist/models/...`, served from the Netlify CDN) and the function
+downloads it into `/tmp/webgpt/models/` on the first request that needs it. The
+download is streamed to a `.part` file, verified against the pinned SHA-256
+checksum and byte size, and only then renamed into place. A failed or corrupt
+download is deleted and retried, and partial files are cleaned up. The verified
+copy is reused for the lifetime of the execution environment.
 
 ---
 
 ## Deployment-Size Report
 
-Measured against the compiled production build (`npm run build`), `esbuild`-bundled Netlify Function (`netlify/functions/api.mts`), minimal `llama.cpp` CPU runtime (`runtime/llama/`), and the verified GGUF weights:
+Measured against the production build and the `esbuild`-bundled Netlify Function:
 
-| Component | Uncompressed Size | Notes |
+| Component | Size | Notes |
 | --- | --- | --- |
-| Frontend (`dist/`) | 939,079 B (0.94 MB / 0.90 MiB) | Vite React + Tailwind CSS production assets |
-| Bundled Function + Backend (`api.mjs`) | 28,609 B (0.03 MB / 0.03 MiB) | Bundled via `esbuild` (`--platform=node --target=node22`) |
-| Native Runtime (`runtime/llama/`) | 17,013,464 B (17.01 MB / 16.23 MiB) | `llama-completion` + `libllama` + `libggml` CPU libs |
-| Model Weights (`Falcon-H1-Tiny-Multilingual-100M-Instruct.Q4_K_M.gguf`) | 73,895,104 B (73.90 MB / 70.47 MiB) | Verified SHA-256 `f8f5c2f964511caf59abfa02b6b8a6867b9c429ef3366b5a3ac9d5eea79aa0f6` |
-| **Total Deployable Project Footprint** | **91,876,256 B (91.88 MB / 87.62 MiB)** | **Passes `< 150 MB` ideal & `< 200 MB` absolute limit** |
+| Frontend (`dist/`, excluding the model) | 769,308 B (0.77 MB) | Vite React + Tailwind CSS production assets |
+| Model asset (`dist/models/*.gguf`) | 73,895,104 B (73.90 MB) | Static CDN asset, verified SHA-256 `f8f5c2f9...aa0f6` |
+| `llama.cpp` runtime (`runtime/llama/`) | 19,572,536 B (19.57 MB) | `llama-completion` + `libllama`/`libggml` CPU libs + `libstdc++`/`libgomp` |
+| Function ZIP (runtime + backend, no model) | 7,897,427 B zipped / 20,742,142 B raw | Well below the 50 MB Lambda upload cap |
+| **Total deploy footprint** | **~94 MB** | Split between the static deploy and the function bundle |
 
-### Netlify Function Bundle Measurement & Platform Constraint
+### Platform constraints that shaped the implementation
 
-- **Function ZIP including GGUF model:** **76,508,853 B (76.51 MB / 72.96 MiB)**
-  - **Technical Blocker:** Quantized Q4_K_M weights do not compress well under ZIP deflate (70.67 MB zipped alone). Because Netlify Serverless Functions deploy onto AWS Lambda, they enforce a **50 MB (52,428,800 B) zipped deployment archive limit** per function. Bundling the 73.90 MB GGUF directly inside the function ZIP exceeds this 50 MB Lambda upload cap.
-- **Function ZIP with runtime + backend only (smallest compatible Netlify solution):** **5,839,160 B (5.84 MB / 5.57 MiB)**
-  - **How it works:** Keep `runtime/llama/**` + `api.mjs` inside the Netlify Function ZIP (**5.84 MB**, well under 50 MB), host the GGUF asset in Netlify static CDN (`public/models/` -> `dist/models/`), and allow `backend/model/loader.ts` to cold-start hydrate and SHA-256-verify the GGUF into `/tmp/webgpt/models/`. Total project footprint remains **91.88 MB** (`< 200 MB`), while the Netlify Function ZIP stays at **5.84 MB** (`< 50 MB`).
-- **Additional Netlify note:** Netlify synchronous Serverless Functions have a 10s–26s execution timeout; `POST /api/chat/stream` uses Netlify Functions v2 Web Streams (`Response` with `ReadableStream`), and `Falcon-H1-Tiny-Multilingual-100M-Instruct` generates at ~108 tok/s on 4 CPU cores (~250–800 ms per response).
+- **Netlify Function ZIP limit:** the function bundle contains only the runtime
+  and the backend (7.9 MB zipped). The model is served as a static asset.
+- **Synchronous execution limit (60 s):** every request works against an
+  explicit deadline (52 s budget, 40 s generation timeout) and aborts the
+  downstream work (including the model download) before the platform kills the
+  function, so the client always receives a response.
+- **Ephemeral filesystem:** `/tmp` is treated as per-execution-environment
+  scratch space. Nothing is assumed to survive between invocations; the model
+  is re-downloaded and re-verified when the cache is empty.
+- **glibc compatibility:** the bundled `llama.cpp` libraries and the bundled
+  `libstdc++.so.6` / `libgomp.so.1` require at most `GLIBC_2.34` /
+  `GLIBCXX_3.4.30`, which matches the Amazon Linux 2023 (glibc 2.34) image that
+  Netlify Functions run on. Binaries downloaded from the upstream
+  `llama.cpp` Ubuntu releases require glibc 2.35+ and therefore cannot be used
+  as a fallback runtime.
+- **Cross-request cancellation:** `/api/chat/stop` can only stop a generation
+  that runs in the same execution environment. The reliable cancellation path
+  is the client aborting the SSE connection, which is detected and terminates
+  the inference process.

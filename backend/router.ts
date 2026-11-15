@@ -1,4 +1,4 @@
-import { APP_CREATOR, APP_NAME } from './config';
+import { APP_CREATOR, APP_NAME, LIMITS } from './config';
 import {
   getActiveGenerationCount,
   runCompletion,
@@ -58,12 +58,22 @@ function getClientKey(request: Request): string {
   return request.headers.get('x-nf-client-connection-ip') || 'local-client';
 }
 
+/**
+ * Netlify Functions are killed after a fixed amount of wall clock time, so
+ * every request works against an explicit deadline that is comfortably below
+ * the platform limit.
+ */
+function requestDeadline(): number {
+  return Date.now() + LIMITS.requestBudgetMs;
+}
+
 export async function handleApiRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   // Normalize Netlify function path prefix if present
-  const pathname = url.pathname
-    .replace(/^\/\.netlify\/functions\/api/, '/api')
-    .replace(/\/+$/, '') || '/';
+  const pathname =
+    url.pathname
+      .replace(/^\/\.netlify\/functions\/api/, '/api')
+      .replace(/\/+$/, '') || '/';
 
   const origin = request.headers.get('origin');
   const host = request.headers.get('host');
@@ -139,10 +149,18 @@ export async function handleApiRequest(request: Request): Promise<Response> {
       return jsonResponse({ error: safe.message }, safe.statusCode, corsHeaders);
     }
 
+    const deadlineAt = requestDeadline();
+    // Stop every downstream operation (model download included) before the
+    // platform kills the function, so the client always receives a response.
+    const budgetSignal = AbortSignal.any([
+      request.signal,
+      AbortSignal.timeout(Math.max(1_000, deadlineAt - Date.now() - 5_000)),
+    ]);
+
     if (pathname === '/api/chat') {
       try {
-        await ensureModelReady();
-        const result = await runCompletion(validated, request.signal);
+        await ensureModelReady(budgetSignal);
+        const result = await runCompletion(validated, budgetSignal, deadlineAt);
         return jsonResponse(
           {
             id: result.requestId,
@@ -163,18 +181,25 @@ export async function handleApiRequest(request: Request): Promise<Response> {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
+        let closed = false;
         const sendEvent = (event: string, payload: unknown) => {
+          if (closed) return;
           const line = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-          controller.enqueue(encoder.encode(line));
+          try {
+            controller.enqueue(encoder.encode(line));
+          } catch {
+            closed = true;
+          }
         };
 
         try {
           sendEvent('status', { status: 'loading', label: 'Loading...' });
-          await ensureModelReady();
+          await ensureModelReady(budgetSignal);
           sendEvent('start', { requestId: validated.requestId, status: 'ready' });
 
           const result = await streamGeneration(validated, {
-            signal: request.signal,
+            signal: budgetSignal,
+            deadlineAt,
             onToken: (token) => {
               sendEvent('token', { token });
             },
@@ -188,10 +213,16 @@ export async function handleApiRequest(request: Request): Promise<Response> {
           const safe = toSafePublicError(err);
           sendEvent('error', { error: safe.message, code: safe.statusCode });
         } finally {
-          controller.close();
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            // The stream may already be closed by the client.
+          }
         }
       },
       cancel() {
+        // The browser aborted the SSE connection: stop the generation.
         stopGeneration(validated.requestId);
       },
     });
