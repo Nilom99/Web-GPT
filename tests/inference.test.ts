@@ -113,3 +113,70 @@ test('HTTP router endpoints /api/health, /api/model/status, /api/chat, /api/chat
   );
   assert.equal(stopRes.status, 200);
 });
+
+test('POST /api/chat returns a complete assistant message', async () => {
+  const res = await handleApiRequest(
+    new Request('http://localhost:3000/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestId: 'test_http_chat_1',
+        messages: [{ role: 'user', content: 'What is 2 + 2? Answer in one short sentence.' }],
+        maxTokens: 32,
+      }),
+    })
+  );
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as {
+    id: string;
+    role: string;
+    content: string;
+    finishReason: string;
+  };
+  assert.equal(json.id, 'test_http_chat_1');
+  assert.equal(json.role, 'assistant');
+  assert.ok(json.content.length > 0, 'Expected non-empty model output');
+  assert.ok(['stop', 'length', 'aborted'].includes(json.finishReason));
+});
+
+test('aborting an SSE request cancels the running generation', async () => {
+  const controller = new AbortController();
+  const res = await handleApiRequest(
+    new Request('http://localhost:3000/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestId: 'test_sse_abort_1',
+        messages: [
+          { role: 'user', content: 'Write a long detailed essay about the history of bridges.' },
+        ],
+        maxTokens: 512,
+      }),
+      signal: controller.signal,
+    })
+  );
+  assert.equal(res.status, 200);
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let seen = '';
+
+  // Abort shortly after the first token arrives.
+  setTimeout(() => controller.abort(), 300);
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen += decoder.decode(value, { stream: true });
+    if (seen.includes('event: token')) break;
+  }
+  controller.abort();
+
+  // Drain the rest of the stream; the server must close it instead of hanging.
+  while (true) {
+    const { done } = await reader.read();
+    if (done) break;
+  }
+  assert.ok(seen.includes('event:'), 'expected SSE frames before cancellation');
+});
+

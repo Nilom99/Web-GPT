@@ -9,6 +9,8 @@ import {
   RUNTIME_CONFIG,
   getBundledModelPaths,
   getBundledRuntimeDirs,
+  getModelCacheDir,
+  getSiteOrigin,
 } from '../config';
 
 const execFileAsync = promisify(execFile);
@@ -57,7 +59,11 @@ export async function computeFileSha256(filePath: string): Promise<string> {
   });
 }
 
-async function isValidModelFile(filePath: string): Promise<boolean> {
+/**
+ * A model file is only considered usable when both its size and its SHA-256
+ * checksum match the pinned values.
+ */
+export async function isValidModelFile(filePath: string): Promise<boolean> {
   try {
     const stat = await fsp.stat(filePath);
     if (!stat.isFile() || stat.size !== MODEL_CONFIG.expectedBytes) {
@@ -70,18 +76,17 @@ async function isValidModelFile(filePath: string): Promise<boolean> {
   }
 }
 
-async function isValidRuntimeDir(dir: string): Promise<boolean> {
+/**
+ * The bundled runtime is usable when the launcher binary and every shared
+ * library it needs are present.
+ */
+export async function isValidRuntimeDir(dir: string): Promise<boolean> {
   try {
-    const binPath = path.join(dir, RUNTIME_CONFIG.binaryName);
-    const binStat = await fsp.stat(binPath);
-    if (!binStat.isFile() || binStat.size < 10_000) {
-      return false;
-    }
-    // Verify shared libraries are present and not truncated
-    const libLlama = path.join(dir, 'libllama.so.1');
-    const libStat = await fsp.stat(libLlama);
-    if (libStat.size < 1_000_000) {
-      return false;
+    for (const file of RUNTIME_CONFIG.requiredFiles) {
+      const stat = await fsp.stat(path.join(dir, file));
+      if (!stat.isFile() || stat.size < 1024) {
+        return false;
+      }
     }
     return true;
   } catch {
@@ -89,12 +94,37 @@ async function isValidRuntimeDir(dir: string): Promise<boolean> {
   }
 }
 
-async function downloadFileToPath(url: string, destPath: string): Promise<void> {
+/**
+ * Resolves the shared libraries the launcher binary needs. Missing libraries
+ * are reported so a broken bundle fails loudly instead of at inference time.
+ */
+export async function findMissingRuntimeLibraries(dir: string): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync('ldd', [path.join(dir, RUNTIME_CONFIG.binaryName)], {
+      env: { ...process.env, LD_LIBRARY_PATH: dir },
+    });
+    return stdout
+      .split('\n')
+      .filter((line) => line.includes('not found'))
+      .map((line) => line.trim());
+  } catch {
+    // `ldd` is optional; a missing ldd must not block start-up.
+    return [];
+  }
+}
+
+async function downloadFileToPath(
+  url: string,
+  destPath: string,
+  signal?: AbortSignal
+): Promise<void> {
   await fsp.mkdir(path.dirname(destPath), { recursive: true });
-  const tmpPath = `${destPath}.part.${process.pid}`;
-  const response = await fetch(url, { redirect: 'follow' });
+  const tmpPath = `${destPath}.part`;
+  await fsp.rm(tmpPath, { force: true }).catch(() => {});
+
+  const response = await fetch(url, { redirect: 'follow', signal });
   if (!response.ok || !response.body) {
-    throw new Error(`Failed to fetch required asset (${response.status})`);
+    throw new Error(`Failed to fetch required asset (status ${response.status})`);
   }
 
   const writer = fs.createWriteStream(tmpPath);
@@ -120,38 +150,88 @@ async function downloadFileToPath(url: string, destPath: string): Promise<void> 
   }
 }
 
-async function resolveModelPath(): Promise<string> {
+/**
+ * Removes partial downloads left behind by an interrupted invocation.
+ */
+export async function cleanupPartialDownloads(dir: string): Promise<void> {
+  try {
+    const entries = await fsp.readdir(dir);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.endsWith('.part'))
+        .map((entry) => fsp.rm(path.join(dir, entry), { force: true, recursive: true }).catch(() => {}))
+    );
+  } catch {
+    // The cache directory may not exist yet.
+  }
+}
+
+/**
+ * Downloads the model into the execution environment cache and verifies its
+ * checksum before it is accepted. Partial files are always removed.
+ */
+export async function downloadModelToCache(signal?: AbortSignal): Promise<string> {
+  const cacheDir = getModelCacheDir();
+  const cachePath = path.join(cacheDir, MODEL_CONFIG.filename);
+
+  await fsp.mkdir(cacheDir, { recursive: true });
+  await cleanupPartialDownloads(cacheDir);
+
+  if (await isValidModelFile(cachePath)) {
+    return cachePath;
+  }
+
+  const origin = getSiteOrigin();
+  const candidateUrls = origin
+    ? [`${origin}${MODEL_CONFIG.staticPath}`, MODEL_CONFIG.url]
+    : [MODEL_CONFIG.url];
+
+  const failures: string[] = [];
+
+  for (const url of candidateUrls) {
+    for (let attempt = 1; attempt <= MODEL_CONFIG.downloadRetries; attempt++) {
+      try {
+        await downloadFileToPath(url, cachePath, signal);
+
+        if (await isValidModelFile(cachePath)) {
+          return cachePath;
+        }
+
+        // Checksum or size mismatch: drop the file and try the next source.
+        await fsp.rm(cachePath, { force: true }).catch(() => {});
+        failures.push(`source ${new URL(url).origin} failed checksum verification`);
+        break;
+      } catch (err) {
+        await fsp.rm(cachePath, { force: true }).catch(() => {});
+        if (signal?.aborted) {
+          throw new Error('Model preparation timed out for this request.');
+        }
+        failures.push(
+          `source ${new URL(url).origin} attempt ${attempt}: ${
+            err instanceof Error ? err.message : 'download failed'
+          }`
+        );
+      }
+    }
+  }
+
+  throw new Error(
+    `Unable to obtain a verified model file. ${failures.join('; ')}`
+  );
+}
+
+export async function resolveModelPath(signal?: AbortSignal): Promise<string> {
   for (const candidate of getBundledModelPaths()) {
     if (await isValidModelFile(candidate)) {
       return candidate;
     }
   }
 
-  // Serverless / ephemeral /tmp hydration when local bundled file is absent or truncated
-  const cachePath = path.join('/tmp', 'webgpt', 'models', MODEL_CONFIG.filename);
-  const originBase = process.env.URL || process.env.APP_URL;
-  const candidateUrls = originBase
-    ? [`${originBase.replace(/\/+$/, '')}/models/${MODEL_CONFIG.filename}`, MODEL_CONFIG.url]
-    : [MODEL_CONFIG.url];
-
-  let lastError: unknown;
-  for (const url of candidateUrls) {
-    try {
-      await downloadFileToPath(url, cachePath);
-      if (await isValidModelFile(cachePath)) {
-        return cachePath;
-      }
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('Unable to verify local inference asset checksum.');
+  // Nothing usable on disk: fetch it into the ephemeral cache.
+  return downloadModelToCache(signal);
 }
 
-async function resolveRuntimeDir(): Promise<string> {
+export async function resolveRuntimeDir(): Promise<string> {
   for (const candidate of getBundledRuntimeDirs()) {
     if (await isValidRuntimeDir(candidate)) {
       await fsp.chmod(path.join(candidate, RUNTIME_CONFIG.binaryName), 0o755).catch(() => {});
@@ -159,42 +239,12 @@ async function resolveRuntimeDir(): Promise<string> {
     }
   }
 
-  // Hydrate minimal runtime into /tmp if workspace binaries were absent or truncated
-  const targetDir = path.join('/tmp', 'webgpt', 'runtime', 'llama');
-  const extractTmp = path.join('/tmp', 'webgpt', 'runtime-extract');
-  const archivePath = path.join('/tmp', 'webgpt', 'llama-bin.tar.gz');
-
-  await fsp.mkdir(targetDir, { recursive: true });
-  await fsp.mkdir(extractTmp, { recursive: true });
-  await downloadFileToPath(RUNTIME_CONFIG.archiveUrl, archivePath);
-  await execFileAsync('tar', ['-xzf', archivePath, '-C', extractTmp]);
-
-  const extractedSubdir = path.join(extractTmp, `llama-${RUNTIME_CONFIG.releaseTag}`);
-  const needed = [RUNTIME_CONFIG.binaryName, ...RUNTIME_CONFIG.requiredLibs];
-  for (const file of needed) {
-    const src = path.join(extractedSubdir, file);
-    const dst = path.join(targetDir, file);
-    await fsp.copyFile(src, dst);
-  }
-  // Ensure soname symlinks exist
-  for (const base of ['libllama', 'libllama-common', 'libggml', 'libggml-base']) {
-    const linkPath = path.join(targetDir, `${base}.so`);
-    await fsp.rm(linkPath, { force: true }).catch(() => {});
-    await fsp.symlink(`${base}.so.1`, linkPath).catch(() => {});
-  }
-  await fsp.chmod(path.join(targetDir, RUNTIME_CONFIG.binaryName), 0o755);
-  await fsp.rm(extractTmp, { recursive: true, force: true }).catch(() => {});
-  await fsp.rm(archivePath, { force: true }).catch(() => {});
-
-  if (!(await isValidRuntimeDir(targetDir))) {
-    throw new Error('Failed to initialize inference runtime.');
-  }
-  return targetDir;
+  throw new Error('Inference runtime is unavailable in this execution environment.');
 }
 
-export async function ensureModelReady(): Promise<ResolvedAssets> {
+export async function ensureModelReady(signal?: AbortSignal): Promise<ResolvedAssets> {
   if (state === 'ready' && resolvedAssets) {
-    // Re-check file presence in case ephemeral storage was wiped
+    // Re-check file presence in case ephemeral storage was wiped.
     if (fs.existsSync(resolvedAssets.modelPath) && fs.existsSync(resolvedAssets.binaryPath)) {
       return resolvedAssets;
     }
@@ -209,7 +259,10 @@ export async function ensureModelReady(): Promise<ResolvedAssets> {
   state = 'loading';
   initPromise = (async () => {
     try {
-      const [modelPath, libDir] = await Promise.all([resolveModelPath(), resolveRuntimeDir()]);
+      const [modelPath, libDir] = await Promise.all([
+        resolveModelPath(signal),
+        resolveRuntimeDir(),
+      ]);
       const binaryPath = path.join(libDir, RUNTIME_CONFIG.binaryName);
       const assets: ResolvedAssets = {
         modelPath,
@@ -232,10 +285,21 @@ export async function ensureModelReady(): Promise<ResolvedAssets> {
   return initPromise;
 }
 
+/**
+ * Warms the runtime up. Safe to call on every request: work is only performed
+ * once per execution environment.
+ */
 export function triggerBackgroundWarmup(): void {
   if (state === 'uninitialized' && !initPromise) {
     ensureModelReady().catch((err) => {
       console.error('[model-loader] warmup error:', err instanceof Error ? err.message : err);
     });
   }
+}
+
+/** Test helper: reset the in-process state between test cases. */
+export function resetModelLoaderState(): void {
+  state = 'uninitialized';
+  resolvedAssets = null;
+  initPromise = null;
 }

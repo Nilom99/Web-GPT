@@ -16,7 +16,7 @@ import {
   buildChatPrompt,
   isIdentityQuery,
 } from '../backend/chat/context';
-import { SYSTEM_PROMPT } from '../backend/config';
+import { LIMITS, SYSTEM_PROMPT } from '../backend/config';
 import {
   deriveConversationTitle,
   formatConversationAsJson,
@@ -31,13 +31,13 @@ test('validateChatRequest accepts valid messages, 4k maxTokens, and strips templ
   });
   assert.equal(req.requestId, 'req_12345');
   assert.equal(req.messages[0].content, 'Hello system');
-  assert.equal(req.maxTokens, 4096);
+  assert.equal(req.maxTokens, LIMITS.defaultMaxTokens);
 
   const clamped = validateChatRequest({
     messages: [{ role: 'user', content: 'hi' }],
     maxTokens: 9000,
   });
-  assert.equal(clamped.maxTokens, 4096);
+  assert.equal(clamped.maxTokens, LIMITS.maxOutputTokens);
 });
 
 test('validateChatRequest rejects empty, invalid role, and oversized messages', () => {
@@ -87,7 +87,7 @@ test('evaluateCorsOrigin enforces strict allowed origins', () => {
   assert.equal(evaluateCorsOrigin(undefined, 'localhost:3000').allowed, true);
   assert.equal(evaluateCorsOrigin('http://localhost:3000', 'localhost:3000').allowed, true);
   assert.equal(
-    evaluateCorsOrigin('https://verdant-kangaroo-6053a5.netlify.app', 'other.com').allowed,
+    evaluateCorsOrigin('https://nilgpt.netlify.app', 'nilgpt.netlify.app').allowed,
     true
   );
   assert.equal(evaluateCorsOrigin('https://evil.example.com', 'localhost:3000').allowed, false);
