@@ -1,0 +1,6 @@
+{
+  "name": "SM GPT",
+  "description": "SM GPT — An AI assistant created by Abdus Nilom.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
